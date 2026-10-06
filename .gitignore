@@ -1,0 +1,10 @@
+# 编译产物（tools/Makefile 生成）
+tools/clip-multi
+
+# 编辑器/系统垃圾
+*.swp
+*~
+.DS_Store
+
+# 安装器产生的备份（留在 ~/.config 里，不属于本仓库）
+config.kdl.before-niri-clipboard-*

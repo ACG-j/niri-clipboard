@@ -1,0 +1,33 @@
+// ============================================================================
+// niri 侧：剪切板相关片段
+//
+// 这段不是要被 include 的模块，而是"该改哪里"的记录 + 可直接抄的写法。
+// install.sh 会幂等地把 ~/.config/niri/config.kdl 里的
+//   spawn-at-startup "clipsync"
+// 注释掉并插入说明块。
+// ============================================================================
+
+// 1) 不要在这里启动任何 X11<->Wayland 桥。
+//
+//    niri 会把 X11 交给 xwayland-satellite，而 satellite 自己就实现了
+//    selection 桥（src/xstate/selection.rs）。再起第二个桥（clipsync / 任何
+//    xclip 方案）会让同一块 X11 CLIPBOARD 出现两个 owner，结果是：
+//      - 两桥互相覆盖 → 双向都不通（X11 owner 变 0x0，卡死态）
+//      - 大图经 xclip 的 INCR 与卫星互锁 → X11 侧粘贴卡死
+//      - 只写单一 target → 富文本被降级成纯文本
+//
+//    clipferry 由 systemd user 服务管理（Enable 在 graphical-session.target），
+//    默认 backstop 模式：被动监听，只在 200ms 内没人补位时才接管，
+//    因此和卫星结构性共存。所以这里**什么都不用 spawn**。
+//
+// 2) 如果你还是想用 spawn-at-startup 手工起（不推荐，服务方式更好管）：
+//
+//    spawn-at-startup "clipferry" "--eager-max-size" "256M" "--primary"
+//
+//    但仍然要确认没有第二个桥同时运行。
+
+// 3) 排查时看这些：
+//    journalctl --user -u clipferry.service -f
+//    journalctl --user -b | grep -iE 'satellite.*selection|error writing selection'
+//    niri msg version            # 确认 niri 版本
+//    xwayland-satellite          # 确认卫星在跑
