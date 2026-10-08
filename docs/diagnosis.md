@@ -305,3 +305,82 @@ ps -eo stat | awk '$1 ~ /^D/'
 - `jmylchreest/clipferry` — `DESIGN.md` §4.2（W→X 必须 eager 抓取）、§4.3（按身份防回环）、§10.1（与卫星共存）
 - `astrand/xclip` issue #43 — 大 buffer / INCR 缺陷
 - Mozilla bug 1942284 — Niri 下复制图片导致 hang
+
+## 2026-10-08 追加二：找到「窗口假死」的真正机制 —— 坏的 X11 CLIPBOARD owner
+
+用户报「微信/QQ 总是卡死，现在还卡着」，并确认**本机微信/QQ、ToDesk 窗口、ToDesk 远端全都卡**（全局性）。
+
+### 系统层面全部健康（再次实测）
+
+| 检查 | 结果 |
+| --- | --- |
+| niri IPC 往返 | 7–16 ms |
+| X11 往返 (xdotool) | 3–8 ms |
+| fcitx5 | 0% CPU，DBus 往返 5 ms |
+| 谁持有 /dev/input | 只有 systemd/logind/upowerd/**niri**/dms —— ToDesk 未抓输入设备 |
+| i915 | `wedged=0`、`display_reset_count=0`、pipe A active、无 underrun |
+| 屏幕内容 | 连拍两张**有变化**（不是画面冻结） |
+| CPU / 内存 PSI | 0.00% / 0.00% |
+| 线程进展 | niri 69、Xwayland 86、微信主线程 12 jiffies/4s，**都在跑** |
+
+所以卡的不是 CPU、不是内存、不是磁盘、不是输入法、不是 GPU wedge、不是输入设备被抓。
+
+### 真正的机制：一个 X11 客户端占着 CLIPBOARD 永不应答
+
+```
+CLIPBOARD owner = 0x5000001   （1x1 窗口，位于 -10,-10，无 WM_CLASS / _NET_WM_PID / WM_NAME）
+
+读 TARGETS              2 ms   ← 秒回，说明它的 X 连接活着、在处理事件
+读 UTF8_STRING       5004 ms   ← 不应答
+读 text/plain        5007 ms
+读 text/plain;charset=utf-8  5007 ms
+读 text/html         5006 ms
+读 image/png         5008 ms
+```
+
+**任何 X11 客户端去读剪贴板都会阻塞约 5 秒然后拿到空数据。**
+微信是 Qt/X11 客户端、QQ 是 Electron/X11、ToDesk 是 X11 —— 全都中招。
+ToDesk 自己的日志把这一点记录得非常直白：
+
+```
+client*.log:  wait clipboard_data timeout     ← 每 5 秒一次，与 5s 卡顿完全对应
+```
+
+### 归因实验：责任完全在一个客户端上，与桥无关
+
+换掉 owner 再测同一组请求：
+
+| owner | TARGETS | UTF8_STRING | text/plain |
+| --- | --- | --- | --- |
+| `0x5000001`（原始） | 2 ms | **5004 ms** | **5007 ms** |
+| xclip 抢占后 | 3 ms | **5 ms** | **5 ms** |
+| wl-copy（经卫星镜像到 X11） | 4 ms | **3 ms** | **3 ms** |
+
+并且 A/B 证明**与 clipferry 无关**：
+
+| 阶段 | owner | TARGETS | 读数据 |
+| --- | --- | --- | --- |
+| clipferry 运行中 | `0x5000001` | 3 ms | 5005 ms |
+| **clipferry 停止** | `0x5000001` | 4 ms | 5007 ms |
+
+而且 ToDesk 的 `wait clipboard_data timeout` 在 **10-03、10-06 就出现过**，早于 clipferry 的 10-07 安装
+→ **这是既有问题，不是这套方案引入的**。
+
+### 客户端特征（用于定位）
+
+- X11 resource base = **0x5000000（slot 40）**
+- **只有一个窗口**：1x1、位于 (-10,-10)、无任何属性 → 后台 helper，不是 GUI 程序
+- 只广告 `TIMESTAMP / TARGETS / UTF8_STRING` 三个 target
+
+排查工具见 `tools/clipboard-owner-watch.sh`（按"谁复制后变成坏 owner"做行为识别）。
+
+当前最长嫌疑：`ToDesk` —— 它是唯一一个有 **6 条 X11 连接**的进程（普通 Qt 应用只有 1 条），
+且它自己在同步远端 Windows 的剪贴板。已排除：cc-switch、wpscloudsvr、xembedsniproxy、ghelper
+（逐个结束进程后 0x5000001 窗口仍存在）。
+
+### 立即缓解
+
+1. **ToDesk 里关闭「剪贴板同步」**（或不用远控时退出 ToDesk）——若卡死消失即确诊。
+2. 装一个 X11 剪贴板管理器（如 `copyq`/`clipmenud`）让它持有 CLIPBOARD：
+   它只在接管时付一次 5 秒代价，之后所有应用查剪贴板都走它的健康 owner，
+   相当于把这个坏 owner **屏蔽掉**。（这也解释了为什么当年的 clipsync 对微信"看起来有效"。）
