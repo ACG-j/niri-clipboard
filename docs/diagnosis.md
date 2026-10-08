@@ -183,6 +183,101 @@ ps -eo pid,ppid,args | grep -E 'clipsync|xclip|clipnotify|wl-paste|clipferry'
 journalctl --user -b | grep -iE 'satellite.*(selection|clipboard|incr)'
 ```
 
+## 2026-10-08 追加：`--primary` 循环回归 + WeChat/QQ 假死排查
+
+### A. `--primary` 造成的 PRIMARY 自维持循环（真实缺陷，已修复）
+
+前一天给 clipferry 加了 `--primary`。次日实测：
+
+```text
+本 boot clipferry 共 475 次 claim
+  sel=primary  469 次   ← 99%
+  sel=clipboard  6 次
+
+细分:
+  447  side=x11   sel=primary  reason=proxy-wayland
+   22  side=wayland sel=primary reason=proxy-x11
+```
+
+447 次 “Wayland PRIMARY 变了 → 抢 X11 PRIMARY”是自维持循环：
+clipferry 抢 X11 → 卫星把 claim 镜像回 Wayland → clipferry 再看到
+Wayland 变化 → 再抢 … 而 X11 应用（WeChat 就是 X11 客户端，
+`QT_QPA_PLATFORM=xcb`）每次选中文字都会设置 PRIMARY。
+
+对照实验（外部只做 5 次 PRIMARY 更新，其余不变）：
+
+| clipferry | claim | 卫星 selection 错误 |
+| --- | --- | --- |
+| 停止 | 0 | 0 |
+| `--eager-max-size 256M` | **0** | **0** |
+| `--eager-max-size 256M --primary` | 5 | 2 |
+
+修复：从 drop-in 中删除 `--primary`。重启后 30s 内 claim = 1（startup_fill）。
+
+同时观察到卫星持续报（对应自己 claim 的过期 requestor）：
+
+```text
+Failed to send selection request notify: ... major_opcode: 25 (SendEvent), error_code: 3 (BadWindow)
+Failed setting selection property:     ... major_opcode: 18 (ChangeProperty), error_code: 3
+```
+
+### B. 假死排查：系统级全部干净
+
+自述症状：**窗口假死**（窗口在但点/打字没反应），触发时机是
+**滚动/加载消息** 与 **挂着就卡**——不包含复制粘贴。
+
+实测：
+
+| 指标 | 结果 | 结论 |
+| --- | --- | --- |
+| PSI cpu full avg300 | **0.00%** | 无 CPU 争抢（20 核 i7-13650HX） |
+| PSI memory full avg300 | **0.05%** | 无内存压力，可用 18.1 GiB |
+| PSI io | 先误读为 56% | **是排查命令自己造成的**，见下 |
+| 写 50MB + fsync | **0.027s** | 文件系统很快 |
+| nvme0n1 / nvme1n1 | 0.0 MB/s | 盘空闲 |
+| btrfs device stats | 全 0 | 无损坏/无 IO 错误 |
+| OOM / 段错误 / hung_task | 无 | — |
+| 全线程 D 状态 | 仅 `kworker+…i915_flip`，间歇 | vblank 等待，非持续挂死 |
+| WeChat / QQ | CPU 在跑、窗口存活 | 采样时未卡 |
+
+#### 误判的教训：PSI 读数被自己的排查命令污染
+
+初次看到：
+
+```text
+io: some avg10=59.89  full avg10=56.55
+按 cgroup: app-niri-ghostty-92407.scope/io.pressure = 100.00
+```
+
+但同一时刻磁盘 0 IOPS、写延迟 0.027s。原因：**Pi 自身跑在
+`app-niri-ghostty-*.scope` 里**，而排查过程中执行了
+`sudo du -xhd1 /`（扫 476GB 元数据）和 `grep -r` 读大日志。
+静默 30s 重测后仍高，最后按 cgroup + 设备计数对账才发现是自污染。
+
+正确做法：测资源停等前先确认“被测者不是自己”，并把 PSI 与
+设备级字节计数交叉验证。
+
+#### 解析教训：D 状态必须扫线程，且要正确解析带空格的 comm
+
+```bash
+# 错：ps 默认只看进程主线程；且 /proc/PID/stat 的第 3 字段在 comm 含空格时会错位
+ps -eo stat | awk '$1 ~ /^D/'
+# 对：扫 /proc/*/task/*，状态取最后一个 ')' 之后的第一个字符
+```
+
+否则会把 `Msg Db Writer` / `Appearance D-Bu` 这类线程名误判成 D 状态。
+
+### C. 本次未排除的嫌疑
+
+- WeChat 以 **`FCITX_QT_USE_SYNC=1`** 启动（同步输入法调用），
+  Qt/X11 下是经典的卡顿源。
+- niri 偶发 `[GL] GL_INVALID_VALUE in glTexSubImage2D(xoffset 0 + width 32 > 24)`
+  （4 次 / boot）。
+- QQ 跑在 Wayland（`ELECTRON_OZONE_PLATFORM_HINT=wayland`），
+  WeChat 跑在 X11；两者渲染路径不同但都会“假死”。
+
+→ 已部署 `tools/freeze-witness.sh` 常驻取证，等下次卡死时抓现场。
+
 ## 参考
 
 - `Supreeeme/xwayland-satellite` — `ARCHITECTURE.md`、`src/xstate/selection.rs`、issues #91 / #433 / #485
