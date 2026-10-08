@@ -1,0 +1,19 @@
+#!/bin/sh
+# 变体 C：QQ，加 --disable-gpu-compositing。
+#
+# 检验假设：Electron 的 GPU 合成与 niri 不兼容导致卡死。
+#           依据：niri 讨论 #3777 指出 Electron 应用在 niri 下闪屏/卡顿，
+#                 --disable-gpu 或 --disable-gpu-compositing 可解。
+#
+# 用法：先完全退出 QQ，再 `qq-nogpucomp [QQ 参数...]`
+set -eu
+
+if pgrep -f 'linuxqq|/tmp/.mount_.*qq' >/dev/null 2>&1; then
+  echo "QQ 还在运行。先完全退出：pkill -f 'linuxqq'" >&2
+  exit 1
+fi
+
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+export DESKTOPINTEGRATION=false
+
+exec /usr/bin/linuxqq --no-sandbox --disable-gpu-compositing "$@"

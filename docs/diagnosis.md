@@ -267,16 +267,37 @@ ps -eo stat | awk '$1 ~ /^D/'
 
 否则会把 `Msg Db Writer` / `Appearance D-Bu` 这类线程名误判成 D 状态。
 
-### C. 本次未排除的嫌疑
+### C. 另一个真实故障：僵死的 FUSE 挂载点 `/tmp/fuse`（已修复）
+
+排查中发现 `/tmp/fuse` 挂着一个**没有任何守护进程**的裸 FUSE 挂载：
+
+```text
+/dev/fuse on /tmp/fuse type fuse rw,nosuid,nodev,relatime,user_id=1000,group_id=1000
+```
+
+- `stat -f` 返回 **0 块**；访问它 5s 超时；无人持有。
+- 后果：**任何递归遍历 `/tmp` 的程序都会挂在这里**（实测 `find /tmp` 超时）。
+- 修复：`sudo umount -l /tmp/fuse`。卸载后 `/tmp` 遍历 4226 条目仅 **3 ms**，
+  `/sys/fs/fuse/connections/87` 也随之消失。
+
+> 误判提醒：`systemd-private-*` 目录对普通用户是**立即 EACCES**（私有 tmp），
+> 不是卡住。区分“超时（rc=124）”与“权限失败（rc=2）”很重要，
+> 否则会把正常目录当故障。
+
+### D. 本次未排除的嫌疑
 
 - WeChat 以 **`FCITX_QT_USE_SYNC=1`** 启动（同步输入法调用），
-  Qt/X11 下是经典的卡顿源。
+  Qt/X11 下是经典的卡顿源。详见 `tools/app-freeze/README.md`。
 - niri 偶发 `[GL] GL_INVALID_VALUE in glTexSubImage2D(xoffset 0 + width 32 > 24)`
   （4 次 / boot）。
-- QQ 跑在 Wayland（`ELECTRON_OZONE_PLATFORM_HINT=wayland`），
+- QQ 跑在 Wayland（`ELECTRON_OZONE_PLATFORM_HINT=wayland`，但无 `--enable-wayland-ime`），
   WeChat 跑在 X11；两者渲染路径不同但都会“假死”。
+- 根 btrfs **96% 满、未分配空间只剩 1 MiB**（`Device unallocated: 1.00MiB`）。
+  虽当前实测写入 50MB+fsync 仅 0.027s，但这是 btrfs 经典的停等/只读风险点，
+   `/var/cache/pacman/pkg` 有 14G 可清。
 
-→ 已部署 `tools/freeze-witness.sh` 常驻取证，等下次卡死时抓现场。
+→ 已部署 `tools/freeze-witness.sh` 常驻取证，
+加上 `tools/app-freeze/` 下的 A/B 启动器，等下次卡死时定位。
 
 ## 参考
 

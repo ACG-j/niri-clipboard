@@ -1,0 +1,23 @@
+#!/bin/sh
+# 变体 B：微信，改走原生 Wayland + text-input-v3（不再 xcb、不再同步 IM）。
+#
+# 检验假设：xcb 后端 + fcitx5 的 Qt 插件路径本身是根因。
+#           依据：Arch 中文 wiki 指 wechat-bin 4.1.13.x 应使用
+#           QT_IM_MODULE=text-input-unstable-v3 强制走 text-input-v3 协议。
+#
+# 用法：先完全退出微信（含托盘），再 `wechat-wayland [微信参数...]`
+set -eu
+
+if pgrep -f '/opt/wechat/wechat' >/dev/null 2>&1; then
+  echo "微信还在运行。先完全退出（含托盘）：pkill -f '/opt/wechat/wechat'" >&2
+  exit 1
+fi
+
+# 不再强制 xcb —— 让 Qt 用 Wayland 后端
+unset QT_QPA_PLATFORM
+export QT_IM_MODULE=text-input-unstable-v3
+export GTK_IM_MODULE=fcitx
+export XMODIFIERS='@im=fcitx'
+unset FCITX_QT_USE_SYNC
+
+exec /opt/wechat/wechat "$@"
